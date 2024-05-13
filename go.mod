@@ -10,7 +10,7 @@ require (
 	github.com/google/go-tpm v0.3.3
 	github.com/gorilla/mux v1.7.2
 	github.com/kr/text v0.2.0 // indirect
-	github.com/lf-edge/eve-api/go v0.0.0-20231214160111-99ce4e43be4b
+	github.com/lf-edge/eve-api/go v0.0.0-20240424223403-4feef58259f3
 	github.com/magiconair/properties v1.8.4 // indirect
 	github.com/mitchellh/mapstructure v1.4.1 // indirect
 	github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e // indirect
@@ -29,9 +29,11 @@ require (
 	golang.org/x/text v0.3.8 // indirect
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 	google.golang.org/appengine v1.6.7 // indirect
-	google.golang.org/protobuf v1.28.1
+	google.golang.org/protobuf v1.33.0
 	gopkg.in/check.v1 v1.0.0-20200227125254-8fa46927fb4f // indirect
 	gopkg.in/ini.v1 v1.62.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.0 // indirect
 )
+
+replace github.com/lf-edge/eve-api/go => github.com/milan-zededa/eve-api/go v0.0.0-20240506083451-e7ee45de31eb
