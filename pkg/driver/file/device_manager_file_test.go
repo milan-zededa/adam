@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -493,7 +494,7 @@ func TestDeviceManager(t *testing.T) {
 		}
 	})
 
-	writeTester := func(t *testing.T, sectionName string, cmd func(int64, uuid.UUID, bool, DeviceManager) error) {
+	writeTester := func(t *testing.T, sectionName string, cmd func(int64, uuid.UUID, bool, *DeviceManager) error) {
 		u, _ := uuid.NewV4()
 		tests := []struct {
 			validMsg     bool
@@ -512,7 +513,7 @@ func TestDeviceManager(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer os.RemoveAll(dir)
-			d := DeviceManager{
+			d := &DeviceManager{
 				databasePath: dir,
 			}
 			sectionPath := path.Join(d.getDevicePath(u), sectionName)
@@ -537,7 +538,7 @@ func TestDeviceManager(t *testing.T) {
 		}
 	}
 	t.Run("TestWriteInfo", func(t *testing.T) {
-		writeTester(t, "info", func(ts int64, u uuid.UUID, validMsg bool, d DeviceManager) error {
+		writeTester(t, "info", func(ts int64, u uuid.UUID, validMsg bool, d *DeviceManager) error {
 			var (
 				msg *info.ZInfoMsg
 				b   []byte
@@ -559,7 +560,7 @@ func TestDeviceManager(t *testing.T) {
 	})
 
 	t.Run("TestWriteLogs", func(t *testing.T) {
-		writeTester(t, "logs", func(ts int64, u uuid.UUID, validMsg bool, d DeviceManager) error {
+		writeTester(t, "logs", func(ts int64, u uuid.UUID, validMsg bool, d *DeviceManager) error {
 			var msg []byte
 			if validMsg {
 				b, err := common.FullLogEntry{}.Json()
@@ -573,7 +574,7 @@ func TestDeviceManager(t *testing.T) {
 	})
 
 	t.Run("TestWriteMetrics", func(t *testing.T) {
-		writeTester(t, "metrics", func(ts int64, u uuid.UUID, validMsg bool, d DeviceManager) error {
+		writeTester(t, "metrics", func(ts int64, u uuid.UUID, validMsg bool, d *DeviceManager) error {
 			var (
 				msg *metrics.ZMetricMsg
 				b   []byte
@@ -787,6 +788,188 @@ func TestDeviceManager(t *testing.T) {
 				t.Errorf("empty error for non-exist device")
 			}
 		}
+	})
+}
+
+func TestDeviceManagerConcurrency(t *testing.T) {
+	// setup creates n devices: directories + cert files on disk (so refreshCache
+	// can re-discover them) plus in-memory cache entries via initDevice.
+	setup := func(t *testing.T, n int) (*DeviceManager, []uuid.UUID) {
+		t.Helper()
+		dir, err := os.MkdirTemp("", "adam-test-concurrent")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(dir) })
+		d := &DeviceManager{databasePath: dir}
+		uids := make([]uuid.UUID, n)
+		for i := range uids {
+			uids[i], _ = uuid.NewV4()
+			certB, _, err := ax.Generate("device", "")
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+			devicePath := d.getDevicePath(uids[i])
+			if err := os.MkdirAll(devicePath, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := ax.WriteCert(certB, path.Join(devicePath, DeviceCertFilename), false); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.initDevice(uids[i]); err != nil {
+				t.Fatalf("initDevice: %v", err)
+			}
+		}
+		return d, uids
+	}
+
+	// Many goroutines each hold cacheM.RLock for their own UUID simultaneously.
+	t.Run("ConcurrentWritesDifferentDevices", func(t *testing.T) {
+		const n = 10
+		d, uids := setup(t, n)
+		var wg sync.WaitGroup
+		payload := []byte("info")
+		wg.Add(n)
+		for _, uid := range uids {
+			uid := uid
+			go func() {
+				defer wg.Done()
+				for i := 0; i < 50; i++ {
+					d.WriteInfo(uid, payload)
+				}
+			}()
+		}
+		wg.Wait()
+	})
+
+	// Different write types on the same device — each targets a distinct ManagedFile
+	// (Info/Logs/Metrics) so multiple concurrent RLock holders don't share state.
+	t.Run("ConcurrentWriteTypesSameDevice", func(t *testing.T) {
+		d, uids := setup(t, 1)
+		u := uids[0]
+		payload := []byte("concurrent")
+		var wg sync.WaitGroup
+		wg.Add(4)
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.WriteInfo(u, payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.WriteLogs(u, payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.WriteMetrics(u, payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.WriteRequest(u, payload) } }()
+		wg.Wait()
+	})
+
+	// Write goroutines (cacheM.RLock) racing with DeviceClear (cacheM.Lock).
+	t.Run("ConcurrentWritesAndDeviceClear", func(t *testing.T) {
+		d, uids := setup(t, 1)
+		u := uids[0]
+		payload := []byte("data")
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() { defer wg.Done(); for i := 0; i < 100; i++ { d.WriteInfo(u, payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 100; i++ { d.WriteLogs(u, payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 10; i++ { d.DeviceClear() } }()
+		wg.Wait()
+	})
+
+	// refreshCache (cacheM.Lock via DeviceList) competing with DeviceClear (cacheM.Lock).
+	t.Run("ConcurrentDeviceListAndClear", func(t *testing.T) {
+		d, _ := setup(t, 3)
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.DeviceList() } }()
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.DeviceList() } }()
+		go func() { defer wg.Done(); for i := 0; i < 5; i++ { d.DeviceClear() } }()
+		wg.Wait()
+	})
+
+	// Write goroutines (RLock) + cache-refresh reads (write lock) + DeviceClear (write lock).
+	t.Run("ConcurrentWritesReadsAndClear", func(t *testing.T) {
+		const n = 5
+		d, uids := setup(t, n)
+		payload := []byte("multi")
+		var wg sync.WaitGroup
+		wg.Add(n + 2)
+		for _, uid := range uids {
+			uid := uid
+			go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.WriteInfo(uid, payload) } }()
+		}
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.DeviceList() } }()
+		go func() { defer wg.Done(); for i := 0; i < 5; i++ { d.DeviceClear() } }()
+		wg.Wait()
+	})
+
+	// refreshCache (write lock, via DeviceCheckCert and DeviceList) interleaving
+	// with write goroutines that hold RLock.
+	t.Run("ConcurrentRefreshCacheAndWrites", func(t *testing.T) {
+		d, uids := setup(t, 3)
+		cert, _, err := ax.GenerateCertAndKey("concurrent-test", "")
+		if err != nil {
+			t.Fatalf("error generating cert: %v", err)
+		}
+		payload := []byte("refresh-race")
+		var wg sync.WaitGroup
+		wg.Add(4)
+		for _, uid := range uids[:2] {
+			uid := uid
+			go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.WriteInfo(uid, payload) } }()
+		}
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.DeviceList() } }()
+		go func() { defer wg.Done(); for i := 0; i < 10; i++ { d.DeviceCheckCert(cert) } }()
+		wg.Wait()
+	})
+
+	// Onboard operations: register (write lock), list (refreshCache+RLock),
+	// remove (filesystem+refreshCache), clear (write lock) all running together.
+	t.Run("ConcurrentOnboardOperations", func(t *testing.T) {
+		d, _ := setup(t, 0)
+		for i := 0; i < 3; i++ {
+			c, _, err := ax.GenerateCertAndKey(fmt.Sprintf("onboard-cn-%d", i), "")
+			if err != nil {
+				t.Fatalf("GenerateCertAndKey: %v", err)
+			}
+			if err := d.OnboardRegister(c, []string{"s1", "s2"}); err != nil {
+				t.Fatalf("OnboardRegister: %v", err)
+			}
+		}
+		newCert, _, err := ax.GenerateCertAndKey("onboard-cn-new", "")
+		if err != nil {
+			t.Fatalf("GenerateCertAndKey: %v", err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(5)
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.OnboardList() } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.OnboardGet("onboard-cn-0") } }()
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.OnboardRegister(newCert, []string{"s3"}) } }()
+		go func() { defer wg.Done(); for i := 0; i < 10; i++ { d.OnboardRemove("onboard-cn-1") } }()
+		go func() { defer wg.Done(); for i := 0; i < 5; i++ { d.OnboardClear() } }()
+		wg.Wait()
+	})
+
+	// Write methods (RLock) concurrent with reader methods (RLock via GetInfoReader etc.).
+	t.Run("ConcurrentWritesAndReaders", func(t *testing.T) {
+		d, uids := setup(t, 3)
+		payload := []byte("data")
+		var wg sync.WaitGroup
+		wg.Add(6)
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.WriteInfo(uids[0], payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.WriteLogs(uids[1], payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.WriteMetrics(uids[2], payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.GetInfoReader(uids[0]) } }()
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.GetLogsReader(uids[1]) } }()
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.GetMetricsReader(uids[2]) } }()
+		wg.Wait()
+	})
+
+	// SetDeviceOptions/GetDeviceOptions (both use short RLock + filesystem) concurrent
+	// with DeviceList (triggers refreshCache write lock).
+	t.Run("ConcurrentOptionsOperations", func(t *testing.T) {
+		d, uids := setup(t, 1)
+		opts := []byte(`{"nonce":"test"}`)
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.GetDeviceOptions(uids[0]) } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.SetDeviceOptions(uids[0], opts) } }()
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.DeviceList() } }()
+		wg.Wait()
 	})
 }
 
