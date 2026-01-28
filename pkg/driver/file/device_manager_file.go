@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lf-edge/adam/pkg/driver/common"
@@ -137,25 +138,20 @@ func (m *ManagedFile) Reader() (common.ChunkReader, error) {
 type DeviceManager struct {
 	databasePath string
 	cacheTimeout int
+
+	// these are for caching only
+	cacheM       sync.RWMutex
 	lastUpdate   time.Time
-	// thse are for caching only
-	onboardCerts            map[string]map[string]bool
-	deviceCerts             map[string]uuid.UUID
-	devices                 map[uuid.UUID]common.DeviceStorage
-	maxLogSize              int
-	maxInfoSize             int
-	maxMetricSize           int
-	maxRequestsSize         int
-	maxFlowMessageSize      int
-	maxAppLogsSize          int
-	currentLogFile          *os.File
-	currentInfoFile         *os.File
-	currentMetricFile       *os.File
-	currentRequestsFile     *os.File
-	currentLogFileSize      int
-	currentInfoFileSize     int
-	currentMetricFileSize   int
-	currentRequestsFileSize int
+	onboardCerts map[string]map[string]bool
+	deviceCerts  map[string]uuid.UUID
+	devices      map[uuid.UUID]common.DeviceStorage
+
+	maxLogSize         int
+	maxInfoSize        int
+	maxMetricSize      int
+	maxRequestsSize    int
+	maxFlowMessageSize int
+	maxAppLogsSize     int
 }
 
 // Name return name
@@ -326,6 +322,9 @@ func (d *DeviceManager) OnboardList() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to refresh certs from filesystem: %v", err)
 	}
+
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	cns := make([]string, 0)
 	for certStr := range d.onboardCerts {
 		certRaw := []byte(certStr)
@@ -379,7 +378,9 @@ func (d *DeviceManager) OnboardClear() error {
 			return fmt.Errorf("unable to remove the onboard directory: %v", err)
 		}
 	}
+	d.cacheM.Lock()
 	d.onboardCerts = map[string]map[string]bool{}
+	d.cacheM.Unlock()
 	return nil
 }
 
@@ -393,6 +394,8 @@ func (d *DeviceManager) DeviceCheckCert(cert *x509.Certificate) (*uuid.UUID, err
 	if err != nil {
 		return nil, fmt.Errorf("unable to refresh certs from filesystem: %v", err)
 	}
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	if u, ok := d.deviceCerts[string(cert.Raw)]; ok {
 		return &u, nil
 	}
@@ -409,6 +412,8 @@ func (d *DeviceManager) DeviceCheckCertHash(hash []byte) (*uuid.UUID, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to refresh certs from Redis: %v", err)
 	}
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	for k, u := range d.deviceCerts {
 		s := sha256.Sum256([]byte(k))
 		if bytes.Equal(hash, s[:]) {
@@ -509,6 +514,8 @@ func (d *DeviceManager) DeviceList() ([]*uuid.UUID, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to refresh certs from filesystem: %v", err)
 	}
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	ids := make([]uuid.UUID, 0, len(d.devices))
 	for u := range d.devices {
 		ids = append(ids, u)
@@ -520,8 +527,9 @@ func (d *DeviceManager) DeviceList() ([]*uuid.UUID, error) {
 	return pids, nil
 }
 
-// initDevice initialize all structures for one device
-func (d *DeviceManager) initDevice(u uuid.UUID) error {
+// initDevice initialize all structures for one device.
+// Cache mutex (d.cacheM) must be held by the caller.
+func (d *DeviceManager) initDeviceLocked(u uuid.UUID) error {
 	// create filesystem tree and subdirs for the new device
 	devicePath := d.getDevicePath(u)
 	err := os.MkdirAll(devicePath, 0755)
@@ -601,7 +609,10 @@ func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certi
 	}
 
 	// create filesystem tree and subdirs for the new device
-	if err := d.initDevice(unew); err != nil {
+	d.cacheM.Lock()
+	err = d.initDeviceLocked(unew)
+	d.cacheM.Unlock()
+	if err != nil {
 		return fmt.Errorf("error initializing device: %v", err)
 	}
 	devicePath := d.getDevicePath(unew)
@@ -635,12 +646,14 @@ func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certi
 	}
 
 	// save new one to cache - just the serial and onboard; the rest is on disk
+	d.cacheM.Lock()
 	d.deviceCerts[string(cert.Raw)] = unew
 
 	// this already was initialized in initDevice()
 	ds := d.devices[unew]
 	ds.Serial = serial
 	ds.Onboard = onboard
+	d.cacheM.Unlock()
 
 	return nil
 }
@@ -680,6 +693,7 @@ func (d *DeviceManager) OnboardRegister(cert *x509.Certificate, serial []string)
 	}
 
 	// update the cache
+	d.cacheM.Lock()
 	if d.onboardCerts == nil {
 		d.onboardCerts = map[string]map[string]bool{}
 	}
@@ -688,13 +702,16 @@ func (d *DeviceManager) OnboardRegister(cert *x509.Certificate, serial []string)
 		serialList[s] = true
 	}
 	d.onboardCerts[certStr] = serialList
-
+	d.cacheM.Unlock()
 	return nil
 }
 
 // WriteRequest record a request
 func (d *DeviceManager) WriteRequest(u uuid.UUID, b []byte) error {
-	if dev, ok := d.devices[u]; ok {
+	d.cacheM.RLock()
+	dev, ok := d.devices[u]
+	d.cacheM.RUnlock()
+	if ok {
 		dev.AddRequest(b)
 		return nil
 	}
@@ -717,6 +734,8 @@ func (d *DeviceManager) WriteInfo(u uuid.UUID, b []byte) error {
 
 // WriteLogs write a message of logs
 func (d *DeviceManager) WriteLogs(u uuid.UUID, b []byte) error {
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	// make sure it is not nil
 	if len(b) < 1 {
 		return nil
@@ -730,6 +749,7 @@ func (d *DeviceManager) WriteLogs(u uuid.UUID, b []byte) error {
 }
 
 // appExists return if an app has been created
+// d.cacheM must be held by the caller for reading at least.
 func (d *DeviceManager) appExists(u, instanceID uuid.UUID) bool {
 	_, err := os.Stat(d.getAppPath(u, instanceID))
 	if err != nil {
@@ -743,6 +763,8 @@ func (d *DeviceManager) appExists(u, instanceID uuid.UUID) bool {
 
 // WriteAppInstanceLogs write a message of AppInstanceLogBundle
 func (d *DeviceManager) WriteAppInstanceLogs(instanceID uuid.UUID, deviceID uuid.UUID, b []byte) error {
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	// make sure it is not nil
 	if len(b) == 0 {
 		return nil
@@ -764,6 +786,8 @@ func (d *DeviceManager) WriteAppInstanceLogs(instanceID uuid.UUID, deviceID uuid
 
 // WriteMetrics write a metrics message
 func (d *DeviceManager) WriteMetrics(u uuid.UUID, b []byte) error {
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	// make sure it is not nil
 	if len(b) < 1 {
 		return nil
@@ -784,7 +808,9 @@ func (d *DeviceManager) WriteCerts(u uuid.UUID, b []byte) error {
 		return fmt.Errorf("unable to refresh certs from filesystem: %v", err)
 	}
 	// look up the device by uuid
+	d.cacheM.RLock()
 	_, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return fmt.Errorf("unregistered device UUID %s", u.String())
 	}
@@ -819,7 +845,9 @@ func (d *DeviceManager) WriteStorageKeys(u uuid.UUID, b []byte) error {
 		return fmt.Errorf("unable to refresh cache from filesystem: %v", err)
 	}
 	// look up the device by uuid
+	d.cacheM.RLock()
 	_, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return fmt.Errorf("unregistered device UUID %s", u.String())
 	}
@@ -873,7 +901,9 @@ func (d *DeviceManager) SetConfig(u uuid.UUID, b []byte) error {
 		return fmt.Errorf("unable to refresh certs from filesystem: %v", err)
 	}
 	// look up the device by uuid
+	d.cacheM.RLock()
 	_, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return fmt.Errorf("unregistered device UUID %s", u.String())
 	}
@@ -890,6 +920,8 @@ func (d *DeviceManager) SetConfig(u uuid.UUID, b []byte) error {
 
 // refreshCache refresh cache from disk
 func (d *DeviceManager) refreshCache() error {
+	d.cacheM.Lock()
+	defer d.cacheM.Unlock()
 	// is it time to update the cache again?
 	now := time.Now()
 	if now.Sub(d.lastUpdate).Seconds() < float64(d.cacheTimeout) {
@@ -1000,7 +1032,7 @@ func (d *DeviceManager) refreshCache() error {
 		}
 		certStr := string(cert.Raw)
 		d.deviceCerts[certStr] = u
-		if err := d.initDevice(u); err != nil {
+		if err := d.initDeviceLocked(u); err != nil {
 			return fmt.Errorf("unable to initialize device structure for device %s: %v", u, err)
 		}
 
@@ -1106,6 +1138,7 @@ func (d *DeviceManager) writeJSONFile(u uuid.UUID, dir, filename string, b []byt
 }
 
 // deviceExists return if a device has been created
+// d.cacheM must be held by the caller for reading at least.
 func (d *DeviceManager) deviceExists(u uuid.UUID) bool {
 	_, err := os.Stat(d.getDevicePath(u))
 	if err != nil {
@@ -1120,6 +1153,8 @@ func (d *DeviceManager) deviceExists(u uuid.UUID) bool {
 // checkValidOnboardSerial see if a particular certificate+serial combinaton is valid
 // does **not** check if it has been used
 func (d *DeviceManager) checkValidOnboardSerial(cert *x509.Certificate, serial string) error {
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	if c, ok := d.onboardCerts[string(cert.Raw)]; ok {
 		// accept the specific serial or the wildcard
 		if _, ok := c[serial]; ok {
@@ -1135,6 +1170,8 @@ func (d *DeviceManager) checkValidOnboardSerial(cert *x509.Certificate, serial s
 
 // getOnboardSerialDevice see if a particular certificate+serial combinaton has been used and get its device uuid
 func (d *DeviceManager) getOnboardSerialDevice(cert *x509.Certificate, serial string) *uuid.UUID {
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	certStr := string(cert.Raw)
 	for uid, dev := range d.devices {
 		if dev.Onboard == nil {
@@ -1166,6 +1203,8 @@ func exists(path string) (bool, error) {
 
 // GetLogsReader get the logs for a given uuid
 func (d *DeviceManager) GetLogsReader(u uuid.UUID) (common.ChunkReader, error) {
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	// check that the device actually exists
 	if !d.deviceExists(u) {
 		return nil, fmt.Errorf("unregistered device UUID: %s", u)
@@ -1175,6 +1214,8 @@ func (d *DeviceManager) GetLogsReader(u uuid.UUID) (common.ChunkReader, error) {
 
 // GetInfoReader get the info for a given uuid
 func (d *DeviceManager) GetInfoReader(u uuid.UUID) (common.ChunkReader, error) {
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	// check that the device actually exists
 	if !d.deviceExists(u) {
 		return nil, fmt.Errorf("unregistered device UUID: %s", u)
@@ -1184,6 +1225,8 @@ func (d *DeviceManager) GetInfoReader(u uuid.UUID) (common.ChunkReader, error) {
 
 // GetRequestsReader get the requests for a given uuid
 func (d *DeviceManager) GetRequestsReader(u uuid.UUID) (common.ChunkReader, error) {
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	// check that the device actually exists
 	if !d.deviceExists(u) {
 		return nil, fmt.Errorf("unregistered device UUID: %s", u)
@@ -1193,6 +1236,8 @@ func (d *DeviceManager) GetRequestsReader(u uuid.UUID) (common.ChunkReader, erro
 
 // WriteFlowMessage write FlowMessage
 func (d *DeviceManager) WriteFlowMessage(u uuid.UUID, b []byte) error {
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	// make sure it is not nil
 	if len(b) < 1 {
 		return nil
@@ -1207,6 +1252,8 @@ func (d *DeviceManager) WriteFlowMessage(u uuid.UUID, b []byte) error {
 
 // GetUUID get UuidResponse for device by uuid
 func (d *DeviceManager) GetUUID(u uuid.UUID) ([]byte, error) {
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	// check that the device actually exists
 	if !d.deviceExists(u) {
 		return nil, fmt.Errorf("unregistered device UUID: %s", u)
@@ -1219,7 +1266,10 @@ func (d *DeviceManager) SetDeviceOptions(u uuid.UUID, b []byte) error {
 	if len(b) < 1 {
 		return fmt.Errorf("empty options")
 	}
-	if !d.deviceExists(u) {
+	d.cacheM.RLock()
+	devExists := d.deviceExists(u)
+	d.cacheM.RUnlock()
+	if !devExists {
 		return fmt.Errorf("unregistered device UUID: %s", u)
 	}
 	// save the device configuration
@@ -1231,7 +1281,10 @@ func (d *DeviceManager) SetDeviceOptions(u uuid.UUID, b []byte) error {
 }
 
 func (d *DeviceManager) GetDeviceOptions(u uuid.UUID) ([]byte, error) {
-	if !d.deviceExists(u) {
+	d.cacheM.RLock()
+	devExists := d.deviceExists(u)
+	d.cacheM.RUnlock()
+	if !devExists {
 		return nil, fmt.Errorf("unregistered device UUID: %s", u)
 	}
 	// read options from disk

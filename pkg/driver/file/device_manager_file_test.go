@@ -517,7 +517,7 @@ func TestDeviceManager(t *testing.T) {
 			}
 			sectionPath := path.Join(d.getDevicePath(u), sectionName)
 			if tt.deviceExists {
-				d.initDevice(u)
+				d.initDeviceLocked(u)
 			}
 			err = cmd(ts, u, tt.validMsg, d)
 			switch {
