@@ -241,9 +241,35 @@ func (s *Server) Start() {
 		ClientCAs:  nil,
 	}
 
+	type connInfo struct {
+		remote string
+		state  http.ConnState
+		since  time.Time
+	}
+
+	var conns sync.Map // map[net.Conn]*connInfo
+
 	server := &http.Server{
 		Handler:   router,
 		TLSConfig: tlsConfig,
+		ConnState: func(c net.Conn, s http.ConnState) {
+			switch s {
+			case http.StateNew:
+				conns.Store(c, &connInfo{
+					remote: c.RemoteAddr().String(),
+					state:  s,
+					since:  time.Now(),
+				})
+
+			case http.StateActive, http.StateIdle:
+				if v, ok := conns.Load(c); ok {
+					v.(*connInfo).state = s
+				}
+
+			case http.StateClosed, http.StateHijacked:
+				conns.Delete(c)
+			}
+		},
 	}
 	log.Println("Starting adam:")
 	for _, ip := range s.ListenIPs {
@@ -264,7 +290,9 @@ func (s *Server) Start() {
 		wg.Add(1)
 		go func(listener net.Listener) {
 			defer wg.Done()
+			log.Printf("Started to serve on %s:%s", listenIP, s.Port)
 			err := server.ServeTLS(listener, s.CertPath, s.KeyPath)
+			log.Printf("Completed serving on %s:%s", listenIP, s.Port)
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Fatalf("HTTPS server error: %v", err)
 			}
@@ -272,6 +300,17 @@ func (s *Server) Start() {
 	}
 	<-irqSig
 	log.Printf("server shutdown starting")
+
+	conns.Range(func(key, value any) bool {
+		ci := value.(*connInfo)
+		log.Printf(
+			"OPEN CONN: remote=%s state=%s open_for=%s",
+			ci.remote,
+			ci.state,
+			time.Since(ci.since),
+		)
+		return true
+	})
 
 	//Create shutdown context with 10 second timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
