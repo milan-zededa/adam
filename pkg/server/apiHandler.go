@@ -116,6 +116,10 @@ func (h *apiHandler) configPost(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg, err := h.manager.GetConfig(*u)
 	if err != nil {
+		if _, isNotFound := err.(*common.NotFoundError); isNotFound {
+			log.Printf("config not found for device %s", u)
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		}
 		log.Printf("error getting device config: %v", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
@@ -148,6 +152,10 @@ func (h *apiHandler) config(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg, err := h.manager.GetConfig(*u)
 	if err != nil {
+		if _, isNotFound := err.(*common.NotFoundError); isNotFound {
+			log.Printf("config not found for device %s", u)
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		}
 		log.Printf("error getting device config: %v", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return

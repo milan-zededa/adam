@@ -592,7 +592,7 @@ func (d *DeviceManager) initDeviceLocked(u uuid.UUID) error {
 }
 
 // DeviceRegister register a new device cert
-func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certificate, serial string, conf []byte) error {
+func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certificate, serial string) error {
 	// refresh certs from filesystem, if needed - includes checking if necessary based on timer
 	err := d.refreshCache()
 	if err != nil {
@@ -638,11 +638,6 @@ func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certi
 		if err != nil {
 			return fmt.Errorf("error saving device serial to %s: %v", serialPath, err)
 		}
-	}
-	// save the base configuration
-	err = d.writeJSONFile(unew, "", deviceConfigFilename, conf)
-	if err != nil {
-		return fmt.Errorf("error saving device config to %s: %v", deviceConfigFilename, err)
 	}
 
 	// save new one to cache - just the serial and onboard; the rest is on disk
@@ -880,12 +875,10 @@ func (d *DeviceManager) GetConfig(u uuid.UUID) ([]byte, error) {
 	b, err := os.ReadFile(fullConfigPath)
 	switch {
 	case err != nil && os.IsNotExist(err):
-		// create the base file if it does not exist
-		b = common.CreateBaseConfig(u)
-		err = d.writeJSONFile(u, "", deviceConfigFilename, b)
-		if err != nil {
-			return nil, fmt.Errorf("error saving device config to %s: %v", deviceConfigFilename, err)
+		err = &common.NotFoundError{
+			Err: fmt.Sprintf("config not found for device UUID %s", u),
 		}
+		return nil, err
 	case err != nil:
 		return nil, fmt.Errorf("could not read config from %s: %v", fullConfigPath, err)
 	}
@@ -1291,17 +1284,13 @@ func (d *DeviceManager) GetDeviceOptions(u uuid.UUID) ([]byte, error) {
 	fullOptionsPath := path.Join(d.getDevicePath(u), deviceOptionsFilename)
 	b, err := os.ReadFile(fullOptionsPath)
 	if err != nil {
-		// if error another than not exists than return
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("could not read options from %s: %v", fullOptionsPath, err)
+		if os.IsNotExist(err) {
+			err = &common.NotFoundError{
+				Err: fmt.Sprintf("options not found for device UUID: %s", u),
+			}
+			return nil, err
 		}
-		// if is not exists, try to create default options
-		cfg := common.CreateBaseDeviceOptions(u)
-		err = d.SetDeviceOptions(u, cfg)
-		if err != nil {
-			return nil, fmt.Errorf("cannot set default options for %s: %s", u, err)
-		}
-		return cfg, nil
+		return nil, fmt.Errorf("could not read options from %s: %v", fullOptionsPath, err)
 	}
 	return b, nil
 }
@@ -1311,5 +1300,16 @@ func (d *DeviceManager) SetGlobalOptions(b []byte) error {
 }
 
 func (d *DeviceManager) GetGlobalOptions() ([]byte, error) {
-	return os.ReadFile(filepath.Join(d.databasePath, globalOptionsFilename))
+	fullOptionsPath := filepath.Join(d.databasePath, globalOptionsFilename)
+	b, err := os.ReadFile(fullOptionsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			err = &common.NotFoundError{
+				Err: "global options not found",
+			}
+			return nil, err
+		}
+		return nil, fmt.Errorf("could not read options from %s: %v", fullOptionsPath, err)
+	}
+	return b, nil
 }

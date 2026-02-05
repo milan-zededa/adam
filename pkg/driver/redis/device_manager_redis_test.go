@@ -91,20 +91,20 @@ func TestDeviceRedis(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to generate new UUID: %v", err)
 	}
-	err = r.DeviceRegister(UUID2, cert2, certOnboard, "------", common.CreateBaseConfig(UUID2))
+	err = r.DeviceRegister(UUID2, cert2, certOnboard, "------")
 	assert.Equal(t, nil, err)
 	UUID3, err := uuid.NewV4()
 	if err != nil {
 		t.Fatalf("unable to generate new UUID: %v", err)
 	}
-	err = r.DeviceRegister(UUID3, cert3, certOnboard, "------", common.CreateBaseConfig(UUID3))
+	err = r.DeviceRegister(UUID3, cert3, certOnboard, "------")
 	assert.Equal(t, nil, err)
 
 	UUID1, err := uuid.NewV4()
 	if err != nil {
 		t.Fatalf("unable to generate new UUID: %v", err)
 	}
-	err = r.DeviceRegister(UUID1, cert, certOnboard, "123456", common.CreateBaseConfig(UUID1))
+	err = r.DeviceRegister(UUID1, cert, certOnboard, "123456")
 	assert.Equal(t, nil, err)
 	UUID, err := r.DeviceCheckCert(cert)
 	assert.Equal(t, nil, err)
@@ -160,7 +160,7 @@ func TestConfigRedis(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to generate new UUID: %v", err)
 	}
-	err = r.DeviceRegister(UUID, cert, certOnboard, "123456", common.CreateBaseConfig(UUID))
+	err = r.DeviceRegister(UUID, cert, certOnboard, "123456")
 	assert.Equal(t, nil, err)
 
 	conf, err := r.GetConfig(UUID)
@@ -209,7 +209,7 @@ func TestStreamsRedis(t *testing.T) {
 	cert := generateCert(t, "cert", "host")
 	certOnboard := generateCert(t, "onboard", "host")
 
-	err = r.DeviceRegister(u, cert, certOnboard, "123456", common.CreateBaseConfig(u))
+	err = r.DeviceRegister(u, cert, certOnboard, "123456")
 	assert.Equal(t, nil, err)
 
 	var (

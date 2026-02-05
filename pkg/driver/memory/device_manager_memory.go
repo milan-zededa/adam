@@ -258,7 +258,7 @@ func (d *DeviceManager) DeviceList() ([]*uuid.UUID, error) {
 }
 
 // DeviceRegister register a new device cert
-func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certificate, serial string, conf []byte) error {
+func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certificate, serial string) error {
 	// first check if it already exists - this also checks for nil cert
 	u, err := d.DeviceCheckCert(cert)
 	if err != nil {
@@ -277,7 +277,6 @@ func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certi
 	d.devices[unew] = common.DeviceStorage{
 		Onboard: onboard,
 		Serial:  serial,
-		Config:  conf,
 		Logs: &ByteSlice{
 			maxSize: d.maxLogSize,
 		},
@@ -459,6 +458,12 @@ func (d *DeviceManager) GetConfig(u uuid.UUID) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("unregistered device UUID %s", u.String())
 	}
+	if dev.Config == nil {
+		err := &common.NotFoundError{
+			Err: fmt.Sprintf("config not found for device UUID %s", u),
+		}
+		return nil, err
+	}
 	return dev.Config, nil
 }
 
@@ -580,11 +585,10 @@ func (d *DeviceManager) GetDeviceOptions(u uuid.UUID) ([]byte, error) {
 		return nil, fmt.Errorf("no device UUID %s", u)
 	}
 	if dev.Options == nil {
-		cfg := common.CreateBaseDeviceOptions(u)
-		err := d.SetDeviceOptions(u, cfg)
-		if err != nil {
-			return nil, fmt.Errorf("cannot set default options for %s: %s", u, err)
+		err := &common.NotFoundError{
+			Err: fmt.Sprintf("options not found for device UUID: %s", u),
 		}
+		return nil, err
 	}
 	return dev.Options, nil
 }
@@ -596,10 +600,10 @@ func (d *DeviceManager) SetGlobalOptions(b []byte) error {
 
 func (d *DeviceManager) GetGlobalOptions() ([]byte, error) {
 	if d.globalOptions == nil {
-		err := d.SetGlobalOptions(common.CreateBaseGlobalOptions())
-		if err != nil {
-			return nil, err
+		err := &common.NotFoundError{
+			Err: "global options not found",
 		}
+		return nil, err
 	}
 	return d.globalOptions, nil
 }

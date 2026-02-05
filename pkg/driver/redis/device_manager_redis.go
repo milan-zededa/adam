@@ -424,7 +424,7 @@ func (d *DeviceManager) DeviceList() ([]*uuid.UUID, error) {
 }
 
 // DeviceRegister register a new device cert
-func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certificate, serial string, conf []byte) error {
+func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certificate, serial string) error {
 	// refresh certs from Redis, if needed - includes checking if necessary based on timer
 	err := d.refreshCache()
 	if err != nil {
@@ -460,12 +460,6 @@ func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certi
 		if err != nil {
 			return fmt.Errorf("error saving device serial for %v: %v", unew, err)
 		}
-	}
-
-	// save the base configuration
-	err = d.writeJSONMsgPack(unew, deviceConfigsHash, conf)
-	if err != nil {
-		return fmt.Errorf("error saving device config for %v: %v", unew, err)
 	}
 
 	// save new one to cache - just the serial and onboard; the rest is on disk
@@ -727,14 +721,10 @@ func (d *DeviceManager) GetConfig(u uuid.UUID) ([]byte, error) {
 	data, err := d.client.HGet(deviceConfigsHash, u.String()).Result()
 	switch {
 	case err != nil && errors.Is(err, redis.Nil):
-		// if config doesn't exist - create an empty one
-		b = common.CreateBaseConfig(u)
-		if _, err = d.client.HSet(deviceConfigsHash, u.String(), string(b)).Result(); err == nil {
-			_, err = d.client.Save().Result()
+		err = &common.NotFoundError{
+			Err: fmt.Sprintf("config not found for device UUID %s", u),
 		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to save config for %s: %v", u.String(), err)
-		}
+		return nil, err
 	case err != nil:
 		return nil, fmt.Errorf("failed to get config for %s: %v", u.String(), err)
 	default:
@@ -1131,10 +1121,11 @@ func (d *DeviceManager) GetDeviceOptions(u uuid.UUID) ([]byte, error) {
 	}
 	data, err := d.client.HGet(deviceOptionsHash, u.String()).Result()
 	if err != nil {
-		cfg := common.CreateBaseDeviceOptions(u)
-		err = d.SetDeviceOptions(u, cfg)
-		if err == nil {
-			return cfg, nil
+		if errors.Is(err, redis.Nil) {
+			err = &common.NotFoundError{
+				Err: fmt.Sprintf("options not found for device UUID: %s", u),
+			}
+			return nil, err
 		}
 		return nil, fmt.Errorf("failed to get options for %s: %v", u.String(), err)
 	} else {
@@ -1160,10 +1151,11 @@ func (d *DeviceManager) SetGlobalOptions(b []byte) error {
 func (d *DeviceManager) GetGlobalOptions() ([]byte, error) {
 	data, err := d.client.HGet(globalOptionsHash, globalOptionsHash).Result()
 	if err != nil {
-		cfg := common.CreateBaseGlobalOptions()
-		err = d.SetGlobalOptions(cfg)
-		if err == nil {
-			return cfg, nil
+		if errors.Is(err, redis.Nil) {
+			err = &common.NotFoundError{
+				Err: "global options not found",
+			}
+			return nil, err
 		}
 		return nil, fmt.Errorf("failed to get options for %s: %v", globalOptionsHash, err)
 	} else {
