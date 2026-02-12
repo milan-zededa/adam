@@ -10,7 +10,7 @@ require (
 	github.com/golang/protobuf v1.5.0
 	github.com/google/go-tpm v0.3.3
 	github.com/gorilla/mux v1.7.2
-	github.com/lf-edge/eve-api/go v0.0.0-20250922144401-abfd2fa2b728
+	github.com/lf-edge/eve-api/go v0.0.0-20260216143729-2d9b92e761a2
 	github.com/satori/go.uuid v1.2.1-0.20181028125025-b2ce2384e17b
 	github.com/spf13/cobra v1.0.0
 	github.com/spf13/viper v1.7.1
@@ -49,3 +49,5 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/lf-edge/eve-api/go => github.com/milan-zededa/eve-api/go v0.0.0-20260224093646-1ac7cd8d83ac
