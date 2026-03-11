@@ -449,8 +449,7 @@ func (h *adminHandler) deviceRequestsGet(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *adminHandler) deviceMetricsGet(w http.ResponseWriter, r *http.Request) {
-	// TODO reader function
-	h.deviceDataGet(w, r, h.metricsStream, nil, func(in []byte) ([]byte, error) {
+	h.deviceDataGet(w, r, h.metricsStream, h.manager.GetMetricsReader, func(in []byte) ([]byte, error) {
 		var err error
 		msg := &metrics.ZMetricMsg{}
 		if err = proto.Unmarshal(in, msg); err != nil {
