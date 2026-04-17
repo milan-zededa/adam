@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis"
@@ -104,6 +105,7 @@ type DeviceManager struct {
 	cacheTimeout int
 	lastUpdate   time.Time
 	// these are for caching only
+	cacheM       sync.RWMutex
 	onboardCerts map[string]map[string]bool
 	deviceCerts  map[string]uuid.UUID
 	devices      map[uuid.UUID]common.DeviceStorage
@@ -201,6 +203,8 @@ func (d *DeviceManager) OnboardCheck(cert *x509.Certificate, serial string) erro
 		return fmt.Errorf("unable to refresh certs from Redis: %v", err)
 	}
 
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	if err := d.checkValidOnboardSerial(cert, serial); err != nil {
 		return err
 	}
@@ -242,6 +246,8 @@ func (d *DeviceManager) OnboardList() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to refresh certs from Redis: %v", err)
 	}
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	cns := make([]string, 0)
 	for certStr := range d.onboardCerts {
 		certRaw := []byte(certStr)
@@ -269,7 +275,9 @@ func (d *DeviceManager) OnboardClear() error {
 		return fmt.Errorf("unable to remove the onboarding certificates/serials: %v", err)
 	}
 
+	d.cacheM.Lock()
 	d.onboardCerts = map[string]map[string]bool{}
+	d.cacheM.Unlock()
 	return nil
 }
 
@@ -283,6 +291,8 @@ func (d *DeviceManager) DeviceCheckCert(cert *x509.Certificate) (*uuid.UUID, err
 	if err != nil {
 		return nil, fmt.Errorf("unable to refresh certs from Redis: %v", err)
 	}
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	certStr := string(cert.Raw)
 	if u, ok := d.deviceCerts[certStr]; ok {
 		return &u, nil
@@ -300,6 +310,8 @@ func (d *DeviceManager) DeviceCheckCertHash(hash []byte) (*uuid.UUID, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to refresh certs from Redis: %v", err)
 	}
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	for k, u := range d.deviceCerts {
 		s := sha256.Sum256([]byte(k))
 		if bytes.Equal(hash, s[:]) {
@@ -326,9 +338,11 @@ func (d *DeviceManager) DeviceRemove(u *uuid.UUID) error {
 		{deviceFlowMessageStream + k},
 		{deviceRequestsStream + k},
 	}
+	d.cacheM.RLock()
 	for appUUID := range d.devices[*u].AppLogs {
 		streams = append(streams, []string{deviceAppLogsStream + k + "_" + appUUID.String()})
 	}
+	d.cacheM.RUnlock()
 	err := d.transactionDrop(streams)
 
 	if err != nil {
@@ -353,6 +367,7 @@ func (d *DeviceManager) DeviceClear() error {
 		{deviceOnboardCertsHash},
 		{deviceOptionsHash}}
 
+	d.cacheM.RLock()
 	for u, dev := range d.devices {
 		streams = append(streams,
 			[]string{deviceMetricsStream + u.String()},
@@ -364,6 +379,7 @@ func (d *DeviceManager) DeviceClear() error {
 			streams = append(streams, []string{deviceAppLogsStream + u.String() + "_" + appUUID.String()})
 		}
 	}
+	d.cacheM.RUnlock()
 
 	err := d.transactionDrop(streams)
 
@@ -371,8 +387,10 @@ func (d *DeviceManager) DeviceClear() error {
 		return fmt.Errorf("unable to remove all devices %v", err)
 	}
 
+	d.cacheM.Lock()
 	d.deviceCerts = map[string]uuid.UUID{}
 	d.devices = map[uuid.UUID]common.DeviceStorage{}
+	d.cacheM.Unlock()
 	return nil
 }
 
@@ -412,6 +430,8 @@ func (d *DeviceManager) DeviceList() ([]*uuid.UUID, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to refresh certs from Redis: %v", err)
 	}
+	d.cacheM.RLock()
+	defer d.cacheM.RUnlock()
 	ids := make([]uuid.UUID, 0, len(d.devices))
 	for u := range d.devices {
 		ids = append(ids, u)
@@ -469,9 +489,11 @@ func (d *DeviceManager) DeviceRegister(unew uuid.UUID, cert, onboard *x509.Certi
 	}
 
 	// save new one to cache - just the serial and onboard; the rest is on disk
+	d.cacheM.Lock()
 	d.deviceCerts[string(cert.Raw)] = unew
 	d.devices[unew] = d.initDevice(unew, onboard, serial)
 	ds := d.devices[unew]
+	d.cacheM.Unlock()
 
 	// create the necessary Redis streams for this device
 	for _, ms := range []common.BigData{ds.Logs, ds.Info, ds.Metrics, ds.Requests} {
@@ -537,6 +559,7 @@ func (d *DeviceManager) OnboardRegister(cert *x509.Certificate, serial []string)
 	}
 
 	// update the cache
+	d.cacheM.Lock()
 	if d.onboardCerts == nil {
 		d.onboardCerts = map[string]map[string]bool{}
 	}
@@ -545,13 +568,17 @@ func (d *DeviceManager) OnboardRegister(cert *x509.Certificate, serial []string)
 		serialList[s] = true
 	}
 	d.onboardCerts[certStr] = serialList
+	d.cacheM.Unlock()
 
 	return nil
 }
 
 // WriteRequest record a request
 func (d *DeviceManager) WriteRequest(u uuid.UUID, b []byte) error {
-	if dev, ok := d.devices[u]; ok {
+	d.cacheM.RLock()
+	dev, ok := d.devices[u]
+	d.cacheM.RUnlock()
+	if ok {
 		if err := dev.AddRequest(b); err != nil {
 			return fmt.Errorf("AddRequest error: %s", err)
 		}
@@ -567,7 +594,9 @@ func (d *DeviceManager) WriteInfo(u uuid.UUID, b []byte) error {
 		return nil
 	}
 	// check that the device actually exists
+	d.cacheM.RLock()
 	dev, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return fmt.Errorf("device not found: %s", u)
 	}
@@ -581,14 +610,17 @@ func (d *DeviceManager) WriteLogs(u uuid.UUID, b []byte) error {
 		return nil
 	}
 	// check that the device actually exists
+	d.cacheM.RLock()
 	dev, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return fmt.Errorf("device not found: %s", u)
 	}
 	return dev.AddLogs(b)
 }
 
-// appExists return if an app has been created
+// appExists return if an app has been created.
+// d.cacheM must be held by the caller for reading at least.
 func (d *DeviceManager) appExists(u, instanceID uuid.UUID) bool {
 	if _, ok := d.devices[u]; !ok {
 		return false
@@ -605,8 +637,10 @@ func (d *DeviceManager) WriteAppInstanceLogs(instanceID uuid.UUID, deviceID uuid
 	if len(b) < 1 {
 		return nil
 	}
+	d.cacheM.Lock()
 	dev, ok := d.devices[deviceID]
 	if !ok {
+		d.cacheM.Unlock()
 		return fmt.Errorf("unregistered device UUID %s", deviceID)
 	}
 	if !d.appExists(deviceID, instanceID) {
@@ -615,6 +649,7 @@ func (d *DeviceManager) WriteAppInstanceLogs(instanceID uuid.UUID, deviceID uuid
 			client: d.client,
 		}
 	}
+	d.cacheM.Unlock()
 	return dev.AddAppLog(instanceID, b)
 }
 
@@ -625,7 +660,9 @@ func (d *DeviceManager) WriteMetrics(u uuid.UUID, b []byte) error {
 		return nil
 	}
 	// check that the device actually exists
+	d.cacheM.RLock()
 	dev, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return fmt.Errorf("device not found: %s", u)
 	}
@@ -645,7 +682,9 @@ func (d *DeviceManager) WriteCerts(u uuid.UUID, b []byte) error {
 		return fmt.Errorf("unable to refresh certs from Redis: %v", err)
 	}
 	// look up the device by uuid
+	d.cacheM.RLock()
 	_, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return fmt.Errorf("unregistered device UUID %s", u.String())
 	}
@@ -689,7 +728,9 @@ func (d *DeviceManager) WriteStorageKeys(u uuid.UUID, b []byte) error {
 		return fmt.Errorf("unable to refresh certs from Redis: %v", err)
 	}
 	// look up the device by uuid
+	d.cacheM.RLock()
 	_, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return fmt.Errorf("unregistered device UUID %s", u.String())
 	}
@@ -757,7 +798,9 @@ func (d *DeviceManager) SetConfig(u uuid.UUID, b []byte) error {
 		return fmt.Errorf("unable to refresh certs from Redis: %v", err)
 	}
 	// look up the device by uuid
+	d.cacheM.RLock()
 	_, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return fmt.Errorf("unregistered device UUID %s", u.String())
 	}
@@ -774,7 +817,9 @@ func (d *DeviceManager) SetConfig(u uuid.UUID, b []byte) error {
 // GetLogsReader get the logs for a given uuid
 func (d *DeviceManager) GetLogsReader(u uuid.UUID) (common.ChunkReader, error) {
 	// check that the device actually exists
+	d.cacheM.RLock()
 	dev, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("unregistered device UUID: %s", u)
 	}
@@ -784,7 +829,9 @@ func (d *DeviceManager) GetLogsReader(u uuid.UUID) (common.ChunkReader, error) {
 // GetInfoReader get the info for a given uuid
 func (d *DeviceManager) GetInfoReader(u uuid.UUID) (common.ChunkReader, error) {
 	// check that the device actually exists
+	d.cacheM.RLock()
 	dev, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("unregistered device UUID: %s", u)
 	}
@@ -794,7 +841,9 @@ func (d *DeviceManager) GetInfoReader(u uuid.UUID) (common.ChunkReader, error) {
 // GetMetricsReader returns a metrics reader for the specified device.
 func (d *DeviceManager) GetMetricsReader(u uuid.UUID) (common.ChunkReader, error) {
 	// check that the device actually exists
+	d.cacheM.RLock()
 	dev, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("unregistered device UUID: %s", u)
 	}
@@ -804,7 +853,9 @@ func (d *DeviceManager) GetMetricsReader(u uuid.UUID) (common.ChunkReader, error
 // GetRequestsReader get the requests for a given uuid
 func (d *DeviceManager) GetRequestsReader(u uuid.UUID) (common.ChunkReader, error) {
 	// check that the device actually exists
+	d.cacheM.RLock()
 	dev, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("unregistered device UUID: %s", u)
 	}
@@ -813,6 +864,8 @@ func (d *DeviceManager) GetRequestsReader(u uuid.UUID) (common.ChunkReader, erro
 
 // refreshCache refresh cache from disk
 func (d *DeviceManager) refreshCache() error {
+	d.cacheM.Lock()
+	defer d.cacheM.Unlock()
 	// is it time to update the cache again?
 	now := time.Now()
 	if now.Sub(d.lastUpdate).Seconds() < float64(d.cacheTimeout) {
@@ -987,7 +1040,8 @@ func (d *DeviceManager) writeJSONMsgPack(u uuid.UUID, hash string, b []byte) err
 }
 
 // checkValidOnboardSerial see if a particular certificate+serial combinaton is valid
-// does **not** check if it has been used
+// does **not** check if it has been used.
+// d.cacheM must be held by the caller for reading at least.
 func (d *DeviceManager) checkValidOnboardSerial(cert *x509.Certificate, serial string) error {
 	certStr := string(cert.Raw)
 	if c, ok := d.onboardCerts[certStr]; ok {
@@ -1003,7 +1057,8 @@ func (d *DeviceManager) checkValidOnboardSerial(cert *x509.Certificate, serial s
 	return &common.InvalidCertError{Err: "unknown onboarding certificate"}
 }
 
-// getOnboardSerialDevice see if a particular certificate+serial combinaton has been used and get its device uuid
+// getOnboardSerialDevice see if a particular certificate+serial combinaton has been used and get its device uuid.
+// d.cacheM must be held by the caller for reading at least.
 func (d *DeviceManager) getOnboardSerialDevice(cert *x509.Certificate, serial string) *uuid.UUID {
 	certStr := string(cert.Raw)
 	for uid, dev := range d.devices {
@@ -1084,7 +1139,9 @@ func (d *DeviceManager) WriteFlowMessage(u uuid.UUID, b []byte) error {
 		return nil
 	}
 	// check that the device actually exists
+	d.cacheM.RLock()
 	dev, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return fmt.Errorf("device not found: %s", u)
 	}
@@ -1094,7 +1151,9 @@ func (d *DeviceManager) WriteFlowMessage(u uuid.UUID, b []byte) error {
 // GetUUID get UuidResponse for device by uuid
 func (d *DeviceManager) GetUUID(u uuid.UUID) ([]byte, error) {
 	// check that the device actually exists
+	d.cacheM.RLock()
 	_, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("unregistered device UUID: %s", u)
 	}
@@ -1114,7 +1173,9 @@ func (d *DeviceManager) SetDeviceOptions(u uuid.UUID, b []byte) error {
 		return fmt.Errorf("unable to refresh from Redis: %v", err)
 	}
 	// look up the device by uuid
+	d.cacheM.RLock()
 	_, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return fmt.Errorf("unregistered device UUID %s", u.String())
 	}
@@ -1135,10 +1196,14 @@ func (d *DeviceManager) GetDeviceOptions(u uuid.UUID) ([]byte, error) {
 		return nil, fmt.Errorf("unable to refresh from Redis: %v", err)
 	}
 	// look up the device by uuid
+	d.cacheM.RLock()
 	_, ok := d.devices[u]
+	d.cacheM.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("unregistered device UUID %s", u.String())
 	}
+	// Read lock released before calling SetDeviceOptions to avoid deadlock
+	// (SetDeviceOptions calls refreshCache which acquires the write lock).
 	data, err := d.client.HGet(deviceOptionsHash, u.String()).Result()
 	if err != nil {
 		cfg := common.CreateBaseDeviceOptions(u)
