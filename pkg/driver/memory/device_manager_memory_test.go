@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"github.com/stretchr/testify/assert"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/lf-edge/adam/pkg/driver/common"
@@ -758,5 +759,208 @@ func TestDeviceManagerMemory(t *testing.T) {
 				t.Errorf("empty error for non-exist device")
 			}
 		}
+	})
+}
+
+func TestDeviceManagerMemoryConcurrency(t *testing.T) {
+	// setup creates n registered devices directly in the in-memory maps.
+	setup := func(t *testing.T, n int) (*DeviceManager, []uuid.UUID) {
+		t.Helper()
+		d := &DeviceManager{
+			deviceCerts:  make(map[string]uuid.UUID),
+			devices:      make(map[uuid.UUID]common.DeviceStorage),
+			onboardCerts: make(map[string]map[string]bool),
+		}
+		uids := make([]uuid.UUID, n)
+		for i := range uids {
+			uids[i], _ = uuid.NewV4()
+			certB, _, err := ax.Generate("device", "")
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+			cert, err := x509.ParseCertificate(certB)
+			if err != nil {
+				t.Fatalf("ParseCertificate: %v", err)
+			}
+			d.deviceCerts[string(cert.Raw)] = uids[i]
+			d.devices[uids[i]] = common.DeviceStorage{
+				Cert:        cert,
+				Logs:        &ByteSlice{maxSize: maxLogSizeMemory},
+				Info:        &ByteSlice{maxSize: maxInfoSizeMemory},
+				Metrics:     &ByteSlice{maxSize: maxMetricSizeMemory},
+				FlowMessage: &ByteSlice{maxSize: maxFlowMessageSizeMemory},
+				AppLogs:     make(map[uuid.UUID]common.BigData),
+			}
+		}
+		return d, uids
+	}
+
+	// Many goroutines each take d.m.Lock for their own device UUID simultaneously.
+	t.Run("ConcurrentWritesDifferentDevices", func(t *testing.T) {
+		const n = 10
+		d, uids := setup(t, n)
+		var wg sync.WaitGroup
+		payload := []byte("info")
+		wg.Add(n)
+		for _, uid := range uids {
+			uid := uid
+			go func() {
+				defer wg.Done()
+				for i := 0; i < 50; i++ {
+					d.WriteInfo(uid, payload)
+				}
+			}()
+		}
+		wg.Wait()
+	})
+
+	// All write types for the same device compete for d.m.Lock.
+	t.Run("ConcurrentWriteTypesSameDevice", func(t *testing.T) {
+		d, uids := setup(t, 1)
+		u := uids[0]
+		payload := []byte("concurrent")
+		var wg sync.WaitGroup
+		wg.Add(4)
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.WriteInfo(u, payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.WriteLogs(u, payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.WriteMetrics(u, payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.WriteRequest(u, payload) } }()
+		wg.Wait()
+	})
+
+	// Write goroutines (d.m.Lock) racing with DeviceClear (d.m.Lock).
+	t.Run("ConcurrentWritesAndDeviceClear", func(t *testing.T) {
+		d, uids := setup(t, 1)
+		u := uids[0]
+		payload := []byte("data")
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() { defer wg.Done(); for i := 0; i < 100; i++ { d.WriteInfo(u, payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 100; i++ { d.WriteLogs(u, payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 10; i++ { d.DeviceClear() } }()
+		wg.Wait()
+	})
+
+	// DeviceList (RLock) racing with DeviceClear (write lock).
+	t.Run("ConcurrentDeviceListAndClear", func(t *testing.T) {
+		d, _ := setup(t, 3)
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.DeviceList() } }()
+		go func() { defer wg.Done(); for i := 0; i < 50; i++ { d.DeviceList() } }()
+		go func() { defer wg.Done(); for i := 0; i < 5; i++ { d.DeviceClear() } }()
+		wg.Wait()
+	})
+
+	// Write goroutines (write lock) + reader goroutines (RLock) running together.
+	t.Run("ConcurrentWritesAndReaders", func(t *testing.T) {
+		d, uids := setup(t, 3)
+		payload := []byte("data")
+		var wg sync.WaitGroup
+		wg.Add(6)
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.WriteInfo(uids[0], payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.WriteLogs(uids[1], payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.WriteMetrics(uids[2], payload) } }()
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.GetInfoReader(uids[0]) } }()
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.GetLogsReader(uids[1]) } }()
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.GetMetricsReader(uids[2]) } }()
+		wg.Wait()
+	})
+
+	// Write goroutines + reads (RLock) + DeviceClear (write lock), all competing.
+	t.Run("ConcurrentWritesReadsAndClear", func(t *testing.T) {
+		const n = 5
+		d, uids := setup(t, n)
+		payload := []byte("multi")
+		var wg sync.WaitGroup
+		wg.Add(n + 2)
+		for _, uid := range uids {
+			uid := uid
+			go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.WriteInfo(uid, payload) } }()
+		}
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.DeviceList() } }()
+		go func() { defer wg.Done(); for i := 0; i < 5; i++ { d.DeviceClear() } }()
+		wg.Wait()
+	})
+
+	// Onboard operations: register (write lock), get/list/check (RLock),
+	// remove (RLock then write lock gap), clear (write lock) all running together.
+	t.Run("ConcurrentOnboardOperations", func(t *testing.T) {
+		d, _ := setup(t, 0)
+		for i := 0; i < 3; i++ {
+			c, _, err := ax.GenerateCertAndKey(fmt.Sprintf("onboard-cn-%d", i), "")
+			if err != nil {
+				t.Fatalf("GenerateCertAndKey: %v", err)
+			}
+			if err := d.OnboardRegister(c, []string{"s1", "s2"}); err != nil {
+				t.Fatalf("OnboardRegister: %v", err)
+			}
+		}
+		newCert, _, err := ax.GenerateCertAndKey("onboard-cn-new", "")
+		if err != nil {
+			t.Fatalf("GenerateCertAndKey: %v", err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(5)
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.OnboardList() } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.OnboardGet("onboard-cn-0") } }()
+		go func() { defer wg.Done(); for i := 0; i < 20; i++ { d.OnboardRegister(newCert, []string{"s3"}) } }()
+		go func() { defer wg.Done(); for i := 0; i < 10; i++ { d.OnboardRemove("onboard-cn-1") } }()
+		go func() { defer wg.Done(); for i := 0; i < 5; i++ { d.OnboardClear() } }()
+		wg.Wait()
+	})
+
+	// Device lifecycle: DeviceRegister (check+write gap), DeviceGet (RLock),
+	// DeviceList (RLock), DeviceCheckCert (RLock), DeviceRemove (RLock+write gap),
+	// DeviceClear (write lock) all competing.
+	t.Run("ConcurrentDeviceLifecycle", func(t *testing.T) {
+		d, uids := setup(t, 3)
+		// Generate a separate cert for DeviceCheckCert (not in the device map)
+		checkCertB, _, err := ax.Generate("check", "")
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		checkCert, err := x509.ParseCertificate(checkCertB)
+		if err != nil {
+			t.Fatalf("ParseCertificate: %v", err)
+		}
+		// Cert+onboard for DeviceRegister
+		newDevCert, _, err := ax.GenerateCertAndKey("new-dev", "")
+		if err != nil {
+			t.Fatalf("GenerateCertAndKey: %v", err)
+		}
+		onboardCert, _, err := ax.GenerateCertAndKey("onboard", "")
+		if err != nil {
+			t.Fatalf("GenerateCertAndKey: %v", err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(5)
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.DeviceList() } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.DeviceGet(&uids[0]) } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.DeviceCheckCert(checkCert) } }()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 5; i++ {
+				u, _ := uuid.NewV4()
+				d.DeviceRegister(u, newDevCert, onboardCert, "serial", nil)
+			}
+		}()
+		go func() { defer wg.Done(); for i := 0; i < 5; i++ { d.DeviceClear() } }()
+		wg.Wait()
+	})
+
+	// SetDeviceOptions/GetDeviceOptions (write lock) and
+	// SetGlobalOptions/GetGlobalOptions (write lock) all competing.
+	t.Run("ConcurrentOptionsOperations", func(t *testing.T) {
+		d, uids := setup(t, 1)
+		opts := []byte(`{"nonce":"test"}`)
+		globalOpts := []byte(`{"enforceTemplateAttestation":false}`)
+		var wg sync.WaitGroup
+		wg.Add(4)
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.GetDeviceOptions(uids[0]) } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.SetDeviceOptions(uids[0], opts) } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.GetGlobalOptions() } }()
+		go func() { defer wg.Done(); for i := 0; i < 30; i++ { d.SetGlobalOptions(globalOpts) } }()
+		wg.Wait()
 	})
 }
